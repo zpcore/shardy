@@ -152,6 +152,26 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "reshape_propagation_demo_test",
+    srcs = ["reshape_propagation_demo_test.cc"],
+    deps = [
+        ":op_sharding_rule_registry",
+        ":sharding_projection",
+        ":testing_utils",
+        ":utils",
+        "//shardy/dialect/sdy/ir:dialect",
+        "//shardy/dialect/sdy/ir:testing_utils",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Support",
+        "@stablehlo//:stablehlo_ops",
+    ],
+)
+
 cc_library(
     name = "auto_partitioner_registry",
     srcs = ["auto_partitioner_registry.cc"],
