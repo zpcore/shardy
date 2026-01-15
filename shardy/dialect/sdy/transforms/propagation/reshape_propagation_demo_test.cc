@@ -78,6 +78,62 @@ OpTy getFirstOp(ModuleOp module) {
 
 class ReshapePropagationDemoTest : public ShardyTestBase {};
 
+// Helper function to print factor shardings for a tensor
+void printFactorShardings(StringRef label,
+                          const TensorFactorShardings& tensorFactorShardings) {
+  llvm::outs() << label << ":\n";
+  for (const auto& [factorIdx, factorSharding] :
+       tensorFactorShardings.factorIndexToSharding) {
+    llvm::outs() << "  Factor " << factorIdx << ": [";
+    for (AxisRefAttr axis : factorSharding.axisRefs) {
+      llvm::outs() << axis.toString() << ", ";
+    }
+    llvm::outs() << "] isClosed=" << factorSharding.isClosed
+                 << " isMinorMost=" << factorSharding.isMinorMost << "\n";
+  }
+}
+
+// Helper function to simulate propagation and print results
+void simulatePropagationAndPrint(ShardingProjection& projection,
+                                 OpShardingRuleAttr shardingRule,
+                                 MeshAttr mesh) {
+  llvm::outs() << "\n=== Running Propagation (expandSharding) ===\n";
+
+  for (const auto& [factorIdx, operandFactorSharding] :
+       projection.getOperand(0).factorIndexToSharding) {
+    if (operandFactorSharding.axisRefs.empty()) continue;
+
+    auto resultIt =
+        projection.getResult(0).factorIndexToSharding.find(factorIdx);
+    if (resultIt == projection.getResult(0).factorIndexToSharding.end())
+      continue;
+
+    const FactorSharding& resultFactorSharding = resultIt->second;
+    int64_t factorSize = shardingRule.getFactorSizes()[factorIdx];
+
+    int64_t shardedSize = 1;
+    for (AxisRefAttr axis : operandFactorSharding.axisRefs) {
+      shardedSize *= axis.getSize(mesh);
+    }
+
+    bool canPropagate =
+        resultFactorSharding.isMinorMost || (factorSize % shardedSize == 0);
+
+    llvm::outs() << "Factor " << factorIdx << ": axes=[";
+    for (AxisRefAttr axis : operandFactorSharding.axisRefs) {
+      llvm::outs() << axis.toString() << ", ";
+    }
+    llvm::outs() << "] shardedSize=" << shardedSize
+                 << " factorSize=" << factorSize
+                 << " isMinorMost=" << resultFactorSharding.isMinorMost
+                 << " canPropagate=" << canPropagate << "\n";
+
+    if (canPropagate && !resultFactorSharding.isClosed) {
+      projection.expandSharding(factorIdx, operandFactorSharding.axisRefs);
+    }
+  }
+}
+
 // =============================================================================
 // Test 1: Basic reshape split dimension - demonstrates sub-axis creation
 //
@@ -210,27 +266,26 @@ TEST_F(ReshapePropagationDemoTest, ReshapeMergeAndSplitFactors) {
   ShardingProjection projection =
       ShardingProjection::build(op, shardingRule, mesh);
 
-  llvm::outs() << "\nOperand factor shardings:\n";
-  for (const auto& [factorIdx, factorSharding] :
-       projection.getOperand(0).factorIndexToSharding) {
-    llvm::outs() << "  Factor " << factorIdx << ": [";
-    for (AxisRefAttr axis : factorSharding.axisRefs) {
-      llvm::outs() << axis.toString() << ", ";
-    }
-    llvm::outs() << "] isClosed=" << factorSharding.isClosed
-                 << " isMinorMost=" << factorSharding.isMinorMost << "\n";
-  }
+  // Use helper functions to print and propagate
+  printFactorShardings("Operand factor shardings", projection.getOperand(0));
+  printFactorShardings("Result factor shardings (BEFORE propagation)",
+                       projection.getResult(0));
 
-  llvm::outs() << "\nResult factor shardings:\n";
-  for (const auto& [factorIdx, factorSharding] :
-       projection.getResult(0).factorIndexToSharding) {
-    llvm::outs() << "  Factor " << factorIdx << ": [";
-    for (AxisRefAttr axis : factorSharding.axisRefs) {
-      llvm::outs() << axis.toString() << ", ";
-    }
-    llvm::outs() << "] isClosed=" << factorSharding.isClosed
-                 << " isMinorMost=" << factorSharding.isMinorMost << "\n";
-  }
+  // Simulate propagation
+  simulatePropagationAndPrint(projection, shardingRule, mesh);
+
+  printFactorShardings("Result factor shardings (AFTER propagation)",
+                       projection.getResult(0));
+
+  // Reconstruct the result tensor sharding from the projection
+  TensorShardingAttr reconstructedResultSharding =
+      projection.getResult(0).createTensorShardingAttr(
+          &context, shardingRule.getResultMappings()[0],
+          shardingRule.getFactorSizes(), kMeshName, mesh);
+
+  llvm::outs() << "\n=== Final Result ===\n";
+  llvm::outs() << "Reconstructed result sharding: " << reconstructedResultSharding
+               << "\n";
 }
 
 // =============================================================================
@@ -250,9 +305,9 @@ TEST_F(ReshapePropagationDemoTest, ReshapeMergeAndSplitFactors) {
 // =============================================================================
 TEST_F(ReshapePropagationDemoTest, ReshapeMergeAndSplitFactors2) {
   const std::string program = R"mlir(
-    sdy.mesh @mesh = <["x"=4, "y"=4]>
+    sdy.mesh @mesh = <["x"=4, "y"=4, "z"=2]>
 
-    func.func @main(%arg0: tensor<16x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x", "y"}, {}]>})
+    func.func @main(%arg0: tensor<16x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x", "y"}, {"z"}]>})
         -> tensor<8x8xf32> {
       %0 = stablehlo.reshape %arg0 : (tensor<16x4xf32>) -> tensor<8x8xf32>
       return %0 : tensor<8x8xf32>
@@ -265,40 +320,72 @@ TEST_F(ReshapePropagationDemoTest, ReshapeMergeAndSplitFactors2) {
   OpShardingRuleAttr shardingRule = getOrCreateShardingRule(op);
   MeshAttr mesh = getMeshAttr(module.get());
 
-  llvm::outs() << "\n=== Test 2.5: ReshapeMergeAndSplitFactors ===\n";
-  llvm::outs() << "Input shape: [16, 4], Output shape: [8, 8]\n";
   llvm::outs() << "Sharding Rule: " << shardingRule << "\n";
-  llvm::outs() << "Factor sizes: [";
-  for (int64_t size : shardingRule.getFactorSizes()) {
-    llvm::outs() << size << ", ";
+
+  // Print factor sizes
+  llvm::outs() << "\nFactor Sizes:\n";
+  for (const auto& [idx, size] : llvm::enumerate(shardingRule.getFactorSizes())) {
+    llvm::outs() << "  Factor " << idx << ": size = " << size << "\n";
   }
-  llvm::outs() << "]\n";
+
+  // Print operand mappings (dimension -> factors)
+  llvm::outs() << "\nOperand Tensor Mappings (dimension -> factors):\n";
+  for (const auto& [tensorIdx, tensorMapping] :
+       llvm::enumerate(shardingRule.getOperandMappings())) {
+    llvm::outs() << "  Operand " << tensorIdx << ":\n";
+    for (const auto& [dimIdx, dimMapping] :
+         llvm::enumerate(tensorMapping.getDimMappings())) {
+      llvm::outs() << "    Dim " << dimIdx << " -> Factors [";
+      for (int64_t factorIdx : dimMapping.getFactorIndices()) {
+        llvm::outs() << factorIdx << ", ";
+      }
+      llvm::outs() << "]\n";
+    }
+  }
+
+  // Print result mappings (dimension -> factors)
+  llvm::outs() << "\nResult Tensor Mappings (dimension -> factors):\n";
+  for (const auto& [tensorIdx, tensorMapping] :
+       llvm::enumerate(shardingRule.getResultMappings())) {
+    llvm::outs() << "  Result " << tensorIdx << ":\n";
+    for (const auto& [dimIdx, dimMapping] :
+         llvm::enumerate(tensorMapping.getDimMappings())) {
+      llvm::outs() << "    Dim " << dimIdx << " -> Factors [";
+      for (int64_t factorIdx : dimMapping.getFactorIndices()) {
+        llvm::outs() << factorIdx << ", ";
+      }
+      llvm::outs() << "]\n";
+    }
+  }
 
   ShardingProjection projection =
       ShardingProjection::build(op, shardingRule, mesh);
 
-  llvm::outs() << "\nOperand factor shardings:\n";
-  for (const auto& [factorIdx, factorSharding] :
-       projection.getOperand(0).factorIndexToSharding) {
-    llvm::outs() << "  Factor " << factorIdx << ": [";
-    for (AxisRefAttr axis : factorSharding.axisRefs) {
-      llvm::outs() << axis.toString() << ", ";
-    }
-    llvm::outs() << "] isClosed=" << factorSharding.isClosed
-                 << " isMinorMost=" << factorSharding.isMinorMost << "\n";
-  }
+  // Use helper functions to print and propagate
+  printFactorShardings("\nOperand factor shardings", projection.getOperand(0));
+  printFactorShardings("\nResult factor shardings (BEFORE propagation)",
+                       projection.getResult(0));
 
-  llvm::outs() << "\nResult factor shardings:\n";
-  for (const auto& [factorIdx, factorSharding] :
-       projection.getResult(0).factorIndexToSharding) {
-    llvm::outs() << "  Factor " << factorIdx << ": [";
-    for (AxisRefAttr axis : factorSharding.axisRefs) {
-      llvm::outs() << axis.toString() << ", ";
-    }
-    llvm::outs() << "] isClosed=" << factorSharding.isClosed
-                 << " isMinorMost=" << factorSharding.isMinorMost << "\n";
-  }
+  // Simulate propagation
+  simulatePropagationAndPrint(projection, shardingRule, mesh);
+
+  printFactorShardings("\nResult factor shardings (AFTER propagation)",
+                       projection.getResult(0));
+
+  // Reconstruct the result tensor sharding from the projection
+  TensorShardingAttr reconstructedResultSharding =
+      projection.getResult(0).createTensorShardingAttr(
+          &context, shardingRule.getResultMappings()[0],
+          shardingRule.getFactorSizes(), kMeshName, mesh);
+
+  llvm::outs() << "\n=== Final Result ===\n";
+  llvm::outs() << "Reconstructed result sharding: " << reconstructedResultSharding
+               << "\n";
 }
+
+
+
+
 
 
 
